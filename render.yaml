@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: brandguard-api
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: BRANDGUARD_MODEL
+        value: gemini-flash-lite-latest
+      - key: ENV
+        value: production
