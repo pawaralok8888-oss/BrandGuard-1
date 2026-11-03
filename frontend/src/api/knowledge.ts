@@ -1,4 +1,4 @@
-﻿import { apiRequest } from "./client";
+import { apiRequest } from "./client";
 
 export type FactStatus = "Active" | "Expiring soon" | "Expired";
 export type FactSeverity = "High" | "Medium";
@@ -27,6 +27,7 @@ export interface FactItem {
   category: string;
   createdAt?: string;
   updatedAt: string;
+  usedInCount?: number;
 }
 
 // Alias so code written against develop's FactRecord name still compiles.
@@ -50,14 +51,7 @@ export interface GuidelineItem {
   shortName: string;
   title: string;
   text: string;
-  category:
-    | "Terminology"
-    | "Claims & Legal"
-    | "Tone of Voice"
-    | "Formatting"
-    | "Accessibility"
-    | "Brand Assets"
-    | "Security";
+  category: string;
   ruleType: string;
   severity: "critical" | "warning" | "info";
   appliesToChannels: string[];
@@ -67,6 +61,34 @@ export interface GuidelineItem {
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
+  rejectionRate?: number | null;
+}
+
+export interface ImpactPreviewItem {
+  contentId: string;
+  title: string;
+  channel: string;
+  ownerId: string;
+  ownerName: string;
+  oldStatement: string;
+  newStatement: string;
+}
+
+export interface ImpactPreviewResponse {
+  factId: string;
+  oldStatement: string;
+  newStatement: string;
+  affectedItems: ImpactPreviewItem[];
+  affectedOwnerCount: number;
+}
+
+export interface LinkedContentItem {
+  contentId: string;
+  title: string;
+  status: string;
+  channel: string;
+  ownerId: string;
+  ownerName: string;
 }
 
 export interface GuidelineVersionItem {
@@ -89,11 +111,34 @@ export interface GlossaryItem {
   createdAt: string;
 }
 
-export interface UploadGuidelinesResponse {
-  count?: number;
-  imported?: number;
-  message?: string;
-  [key: string]: unknown;
+/** Category names come from the server (GET /api/knowledge/categories). */
+export type GuidelineCategoryName = string;
+
+export const getGuidelineCategories = (): Promise<string[]> =>
+  apiRequest<string[]>("/api/knowledge/categories");
+
+export const getChannels = (): Promise<string[]> =>
+  apiRequest<string[]>("/api/knowledge/channels");
+
+/** Delete a draft rule. The server refuses if the rule is still switched on. */
+export const deleteRulePattern = (id: string): Promise<void> =>
+  apiRequest<void>(`/api/knowledge/rule-patterns/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+/** A rule drafted from an uploaded guideline. It affects checks only once a manager approves it. */
+export interface RulePatternItem {
+  id: string;
+  guidelineId: string | null;
+  kind: "phrase" | "regex" | "name_variant" | "confidential_term" | "required_text";
+  pattern: string;
+  replacement: string;
+  note: string;
+  channel: string | null;
+  isActive: boolean;
+}
+
+export interface UploadedGuideline extends GuidelineItem {
+  ruleCandidates: number;
+  unparsedLines: string[];
 }
 
 export async function getProducts(): Promise<ProductItem[]> {
@@ -122,13 +167,56 @@ export async function getGlossary(): Promise<GlossaryItem[]> {
 
 export async function uploadGuidelinesFile(
   file: File,
-  category: string = "Tone of Voice",
-): Promise<UploadGuidelinesResponse> {
+  category: GuidelineCategoryName = "Tone of Voice",
+): Promise<UploadedGuideline> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("category", category);
-  return apiRequest<UploadGuidelinesResponse>("/api/knowledge/guidelines/upload", {
+  return apiRequest<UploadedGuideline>("/api/knowledge/guidelines/upload", {
     method: "POST",
     body: formData,
+  });
+}
+
+export async function getFactImpactPreview(
+  factId: string,
+  statement: string,
+): Promise<ImpactPreviewResponse> {
+  return apiRequest<ImpactPreviewResponse>(
+    `/api/knowledge/facts/${factId}/impact-preview`,
+    { method: "POST", body: JSON.stringify({ statement }) },
+  );
+}
+
+export async function getFactLinkedContent(
+  factId: string,
+): Promise<LinkedContentItem[]> {
+  return apiRequest<LinkedContentItem[]>(
+    `/api/knowledge/facts/${factId}/linked-content`,
+  );
+}
+
+export async function getRulePatterns(options: {
+  guidelineId?: string;
+  state?: "draft" | "active";
+} = {}): Promise<RulePatternItem[]> {
+  const params = new URLSearchParams();
+  if (options.guidelineId) params.set("guideline_id", options.guidelineId);
+  if (options.state) params.set("state", options.state);
+  const query = params.toString();
+  return apiRequest<RulePatternItem[]>(`/api/knowledge/rule-patterns${query ? `?${query}` : ""}`);
+}
+
+export interface RulePatternPatch {
+  pattern?: string;
+  replacement?: string;
+  note?: string;
+  is_active?: boolean;
+}
+
+export async function updateRulePattern(id: string, patch: RulePatternPatch): Promise<RulePatternItem> {
+  return apiRequest<RulePatternItem>(`/api/knowledge/rule-patterns/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
   });
 }

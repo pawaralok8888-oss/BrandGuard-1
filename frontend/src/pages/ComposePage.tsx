@@ -9,11 +9,24 @@ import StarterKit from "@tiptap/starter-kit";
 import Link from "@tiptap/extension-link";
 import Underline from "@tiptap/extension-underline";
 import { ArrowLeft, Check, CheckCheck, ChevronDown, CircleHelp, FileImage, History, Image as ImageIcon, Instagram, Link2, List, ListOrdered, LoaderCircle, Paperclip, Save, ShieldCheck, Sparkles, X } from "lucide-react";
-import { createContent, getContent, updateContent, type ContentChannel, type ContentInput } from "@/api/content";
+import {
+  ASSET_FORMAT_OPTIONS,
+  createContent,
+  deleteContentImage,
+  getContent,
+  loadContentImageUrl,
+  updateContent,
+  uploadContentImage,
+  type AssetFormat,
+  type ContentChannel,
+  type ContentInput,
+} from "@/api/content";
 import { listFindings, runCheck as runCheckApi, type Finding } from "@/api/checks";
 import { listSources } from "@/api/sources";
 import { submitForReview } from "@/api/review";
 import { decideFinding, type DecisionInput } from "@/api/findings";
+import { listAttachments, attachmentFileUrl, type Attachment } from "@/api/submissions";
+import { apiBlob } from "@/api/client";
 import { wordDiff } from "@/lib/diff";
 import type { BrandSource } from "@/types";
 import { SeverityBadge } from "@/components/shared/SeverityBadge";
@@ -153,6 +166,10 @@ export default function ComposePage() {
   const [submitting, setSubmitting] = useState(false);
   const [attachment, setAttachment] = useState("");
   const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [format, setFormat] = useState<AssetFormat>("");
+  const [pendingImage, setPendingImage] = useState<File | null>(null);
+  const [hasSavedImage, setHasSavedImage] = useState(false);
+  const [imageIsLogo, setImageIsLogo] = useState(false);
   const [sources, setSources] = useState<BrandSource[]>([]);
   const [altText, setAltText] = useState("GreenGlow sunscreen bottle on a light background with green leaves");
 
@@ -185,6 +202,40 @@ export default function ComposePage() {
     editor.view.dispatch(editor.state.tr.setMeta(highlightKey, ranges));
   };
 
+  /** Uploads the picked image to the saved draft, so the image checks can read it on the next check. */
+  const withPendingImage = async (id: string): Promise<string> => {
+    if (pendingImage) {
+      await uploadContentImage(id, pendingImage, altText.trim(), imageIsLogo);
+      setPendingImage(null);
+      setHasSavedImage(true);
+    }
+    return id;
+  };
+
+  const attachImage = (file: File) => {
+    if (imageUrl?.startsWith("blob:")) URL.revokeObjectURL(imageUrl);
+    setPendingImage(file);
+    setAttachment(file.name);
+    setImageUrl(URL.createObjectURL(file));
+  };
+
+  const removeImage = async () => {
+    if (hasSavedImage && contentId) {
+      try {
+        await deleteContentImage(contentId);
+      } catch (error: unknown) {
+        notify(`Could not remove the image: ${errorText(error)}`);
+        return;
+      }
+    }
+    if (imageUrl?.startsWith("blob:")) URL.revokeObjectURL(imageUrl);
+    setPendingImage(null);
+    setAttachment("");
+    setImageUrl(null);
+    setHasSavedImage(false);
+    setImageIsLogo(false);
+  };
+
   /** Saves the draft (creates it if new). Returns the content ID, or null if saving failed. */
   const persistDraft = async (): Promise<string | null> => {
     if (!editor) {
@@ -206,8 +257,9 @@ export default function ComposePage() {
           bodyText,
           bodyHtml,
           altText: altText.trim() || null,
+          format,
         });
-        return contentId;
+        return withPendingImage(contentId);
       }
       const input: ContentInput = {
         title: title.trim(),
@@ -216,7 +268,8 @@ export default function ComposePage() {
         bodyText,
         bodyHtml,
         altText: altText.trim() || null,
-        imageUrl,
+        format,
+        imageUrl: null,
       };
       const created = await createContent(input);
       skipReloadId.current = created.id;
@@ -225,7 +278,7 @@ export default function ComposePage() {
         next.set("id", created.id);
         return next;
       }, { replace: true });
-      return created.id;
+      return withPendingImage(created.id);
     } catch (error: unknown) {
       notify(`Save failed: ${errorText(error)}`);
       return null;
@@ -260,6 +313,9 @@ export default function ComposePage() {
       setTitle(SAMPLE_TITLE);
       setChannel(SAMPLE_CHANNEL);
       setFindings([]);
+      setFormat("");
+      setPendingImage(null);
+      setHasSavedImage(false);
       setRunState("idle");
       editor.commands.setContent(`<p>${escapeHtml(SAMPLE_TEXT)}</p>`);
       return;
@@ -281,7 +337,10 @@ export default function ComposePage() {
       setChannel(record.channel);
       setContentStatus(record.status);
       setAltText(record.altText ?? "");
-      setImageUrl(record.imageUrl ?? null);
+      setFormat(record.format ?? "");
+      setHasSavedImage(Boolean(record.imageUrl));
+      setImageIsLogo(Boolean(record.imageIsLogo));
+      setImageUrl(record.imageUrl ? await loadContentImageUrl(id).catch(() => null) : null);
       editor.commands.setContent(record.bodyHtml || textToHtml(record.bodyText));
       setFindings(existing);
       applyHighlights(existing);
@@ -296,6 +355,45 @@ export default function ComposePage() {
   useEffect(() => {
     void fetchSources();
   }, [fetchSources]);
+
+  // Files submitted on the Submit page for this content. They are shown in place of the sample
+  // image, so it is clear which content the results on the right belong to.
+  const [submittedFiles, setSubmittedFiles] = useState<{ attachment: Attachment; url?: string; text?: string }[]>([]);
+  useEffect(() => {
+    if (!contentId) {
+      setSubmittedFiles([]);
+      return;
+    }
+    let cancelled = false;
+    const urls: string[] = [];
+    (async () => {
+      try {
+        const attachments = await listAttachments(contentId);
+        const loaded = await Promise.all(attachments.map(async (attachment) => {
+          if (attachment.kind === "image") {
+            const url = await attachmentFileUrl(contentId, attachment.id);
+            urls.push(url);
+            return { attachment, url };
+          }
+          if (attachment.kind === "text") {
+            const blob = await apiBlob(
+              `/api/submissions/${encodeURIComponent(contentId)}/attachments/${encodeURIComponent(attachment.id)}/file`,
+            );
+            return { attachment, text: await blob.text() };
+          }
+          return { attachment };
+        }));
+        if (!cancelled) setSubmittedFiles(loaded);
+      } catch {
+        if (!cancelled) setSubmittedFiles([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      urls.forEach((url) => URL.revokeObjectURL(url));
+      setSubmittedFiles([]);
+    };
+  }, [contentId]);
 
   // Load the draft (or the sample) when the page opens or the ID changes.
   useEffect(() => {
@@ -488,7 +586,7 @@ export default function ComposePage() {
           </div> : <>
             <div className="draft-meta-row flex flex-col sm:flex-row gap-2 w-full">
               <input aria-label="Draft title" value={title} onChange={(e) => setTitle(e.target.value)} className="min-h-[40px] w-full" />
-              <label className="channel-select min-h-[40px] w-full sm:w-[130px] shrink-0"><span className="sr-only">Channel</span><select value={channel} onChange={(e) => setChannel(e.target.value)} className="h-full min-h-[40px] w-full"><option>Instagram</option><option>Website</option><option>Email</option><option>Ad</option></select><ChevronDown size={13} /></label>
+              <label className="channel-select min-h-[40px] w-full sm:w-[130px] shrink-0"><span className="sr-only">Channel</span><select value={channel} onChange={(e) => setChannel(e.target.value)} className="h-full min-h-[40px] w-full"><option>Instagram</option><option>Website</option><option>Email</option><option>Ad</option></select><ChevronDown size={13} /></label><label className="channel-select min-h-[40px] w-full sm:w-[170px] shrink-0"><span className="sr-only">Asset type</span><select aria-label="Asset type" value={format} onChange={(e) => setFormat(e.target.value as AssetFormat)} className="h-full min-h-[40px] w-full">{ASSET_FORMAT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={13} /></label>
             </div>
             <div className="editor-toolbar flex items-center overflow-x-auto max-w-full py-1 min-h-[40px]">
               <select aria-label="Text style" defaultValue="paragraph" className="min-h-[32px] sm:min-h-[27px]"><option value="paragraph">Paragraph</option><option value="heading">Heading</option></select>
@@ -508,15 +606,32 @@ export default function ComposePage() {
                 <EditorContent editor={editor} />
                 {activeFinding && <div className="issue-popover"><span className="popover-dot" /><div><strong>{activeFinding.title}</strong><small>{activeFinding.reason}</small></div></div>}
               </div>
-              {imageUrl ? <div className="attached-image"><img src={imageUrl} alt={altText || "Uploaded campaign image"} /><button type="button" aria-label="Remove image" onClick={() => { URL.revokeObjectURL(imageUrl); setImageUrl(null); }}><X size={13} /></button></div>
+              {submittedFiles.length > 0 && (
+                <div className="submitted-content mb-3 rounded-lg border border-slate-200 bg-white p-3">
+                  <p className="text-xs font-semibold text-slate-700">Submitted content (the results on the right are for this)</p>
+                  {submittedFiles.map(({ attachment, url, text }) => (
+                    <div key={attachment.id} className="mt-2">
+                      {url && <img src={url} alt={attachment.filename} className="max-h-72 rounded-md border border-slate-200" />}
+                      {text !== undefined && <pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs text-slate-700">{text.slice(0, 4000)}</pre>}
+                      {url === undefined && text === undefined && <p className="text-xs text-slate-600">{attachment.filename} ({attachment.kind})</p>}
+                      <p className="mt-1 text-[11px] text-slate-500">{attachment.filename}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {submittedFiles.length > 0 ? null : imageUrl ? <div className="attached-image"><img src={imageUrl} alt={altText || "Uploaded campaign image"} /><button type="button" aria-label="Remove image" onClick={removeImage}><X size={13} /></button></div>
                 : <div className="attached-image mock-attached"><div className="mock-product"><span>GreenGlow</span><b>Sun<br />Screen</b><small>SPF 50</small></div><div className="mock-leaves">✦</div><div className="mock-copy">Naturally fresh,<br />every day</div></div>}
               <div className="image-alt-row flex flex-col sm:flex-row gap-2">
                 <label className="flex-1">Image alt text <input value={altText} onChange={(e) => setAltText(e.target.value)} placeholder="Describe the meaningful content of the image" className="min-h-[40px] w-full" /></label>
                 <span className={cn("alt-validity shrink-0", altValid ? "valid" : "invalid")}>{altValid ? <Check size={12} /> : <CircleHelp size={12} />}{altValid ? "Valid" : "Needs review"}</span>
+                <label className="flex items-center gap-2 text-xs text-slate-600" title="Set this before adding the image. The logo check compares it with the approved logo.">
+                  <input type="checkbox" checked={imageIsLogo} onChange={(e) => setImageIsLogo(e.target.checked)} />
+                  This image is our logo
+                </label>
               </div>
             </div>
             <div className="editor-attachment-bar flex flex-wrap items-center gap-2">
-              <label className="attach-action min-h-[40px] inline-flex items-center"><Paperclip size={14} /> Add image or file<input type="file" accept="image/*,.pdf,.doc,.docx" onChange={(e) => { const file = e.target.files?.[0]; if (!file) return; setAttachment(file.name); if (file.type.startsWith("image/")) { if (imageUrl) URL.revokeObjectURL(imageUrl); setImageUrl(URL.createObjectURL(file)); } }} /></label>
+              <label className="attach-action min-h-[40px] inline-flex items-center"><Paperclip size={14} /> Add image<input type="file" accept="image/png,image/jpeg,image/webp" aria-label="Choose an image" onChange={(e) => { const file = e.target.files?.[0]; if (file) attachImage(file); e.target.value = ""; }} /></label>
               {attachment && <span className="attachment-name">{attachment}</span>}
               <span className="char-count ml-auto">{wordCount}/5000 characters</span>
             </div>

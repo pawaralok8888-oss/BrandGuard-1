@@ -6,6 +6,7 @@ from pathlib import PurePath
 from typing import Literal
 
 from fastapi import (
+    Response,
     APIRouter,
     Depends,
     File,
@@ -25,12 +26,72 @@ from app.security import current_user, require_role
 
 import logging
 
+from app.ai.embeddings import KIND_FACT, KIND_GUIDELINE, carry_forward, index_item
+from app.pipeline.guideline_rules import extract_rule_candidates
+from app.services.document_text import (
+    SUPPORTED_EXTENSIONS,
+    UnsupportedDocument,
+    extract_text,
+    max_bytes_for,
+)
+from starlette.concurrency import run_in_threadpool
+import re
 from app.services.checks import run_check
 from app.services.impact import apply_fact_change
+from app.services.notifications import deliver_alerts
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+
+
+def known_categories(conn: Connection) -> list[str]:
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM guideline_categories WHERE is_active = TRUE ORDER BY sort_order, id"
+    ).fetchall()]
+
+
+def known_channels(conn: Connection) -> list[str]:
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM channels WHERE is_active = TRUE ORDER BY sort_order, id"
+    ).fetchall()]
+
+
+def check_category(conn: Connection, category: str) -> None:
+    allowed = known_categories(conn)
+    if category not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown category '{category}'. Allowed: {allowed}",
+        )
+
+
+def check_channels(conn: Connection, channels: list[str]) -> None:
+    allowed = known_channels(conn)
+    for channel in channels:
+        if channel not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid channel '{channel}'. Allowed: {allowed}",
+            )
+
+
+@router.get("/categories")
+def list_categories(
+    user: dict = Depends(current_user),
+    conn: Connection = Depends(get_conn),
+) -> list[str]:
+    """Categories a guideline can use. Any signed-in user can read them."""
+    return known_categories(conn)
+
+
+@router.get("/channels")
+def list_channels(
+    user: dict = Depends(current_user),
+    conn: Connection = Depends(get_conn),
+) -> list[str]:
+    """Channels a guideline can apply to. Any signed-in user can read them."""
+    return known_channels(conn)
 
 EDITOR_ROLES = ("manager", "admin")
 
@@ -47,24 +108,15 @@ FactType = Literal[
     "policy",
 ]
 
-GuidelineCategory = Literal[
-    "Terminology",
-    "Claims & Legal",
-    "Tone of Voice",
-    "Formatting",
-    "Accessibility",
-    "Brand Assets",
-    "Security",
-]
+# Categories and channels are stored in the database (migration 005). Validation checks the table.
+GuidelineCategory = str
 GuidelineSeverity = Literal["critical", "warning", "info"]
-Channel = Literal["Website", "Instagram", "Email", "Ad"]
-ALLOWED_CHANNELS = ("Website", "Instagram", "Email", "Ad")
+Channel = str
 
 GlossaryKind = Literal["term", "product_name"]
 
 # Facts expiring within this many days of today are marked "Expiring soon"
 EXPIRING_SOON_DAYS = 90
-MAX_UPLOAD_SIZE = 1 * 1024 * 1024  # 1 MB
 MAX_GUIDELINE_TEXT_LENGTH = 20000
 
 
@@ -154,10 +206,7 @@ class GuidelineCreate(BaseModel):
     category: GuidelineCategory
     rule_type: str = "warning"
     severity: GuidelineSeverity = "warning"
-    applies_to_channels: list[Channel] = Field(
-        default_factory=lambda: ["Website", "Instagram", "Email", "Ad"],
-        min_length=1,
-    )
+    applies_to_channels: list[Channel] | None = None  # None means every active channel
     required_text: str | None = None
 
 
@@ -178,6 +227,18 @@ FACT_COLUMNS = """
     id, product_id, title, statement, fact_type, structured_value,
     match_keywords, severity_on_change, owner_id, version,
     valid_from, valid_until, status, category, updated_at
+"""
+
+FACT_SELECT_SQL = """
+    f.id, f.product_id, f.title, f.statement, f.fact_type, f.structured_value,
+    f.match_keywords, f.severity_on_change, f.owner_id, f.version,
+    f.valid_from, f.valid_until, f.status, f.category, f.updated_at,
+    (
+        SELECT COUNT(DISTINCT l.content_id)
+        FROM fact_content_links l
+        JOIN content c ON c.id = l.content_id
+        WHERE l.source_kind = 'fact' AND l.fact_id = f.id AND c.status = 'Published'
+    ) AS used_in_count
 """
 
 GUIDELINE_COLUMNS = """
@@ -203,10 +264,12 @@ def to_fact(row: dict) -> dict:
         "status": row["status"],
         "category": row["category"],
         "updatedAt": row["updated_at"],
+        "usedInCount": row.get("used_in_count", 0),
     }
 
 
 def to_guideline(row: dict) -> dict:
+    rejection_rate = row.get("rejection_rate")
     return {
         "id": row["id"],
         "shortName": row["short_name"],
@@ -221,6 +284,11 @@ def to_guideline(row: dict) -> dict:
         "ownerId": row["owner_id"],
         "isActive": row["is_active"],
         "updatedAt": row["updated_at"],
+        "rejectionRate": (
+            round(float(rejection_rate) * 100, 1)
+            if rejection_rate is not None
+            else None
+        ),
     }
 
 
@@ -265,10 +333,10 @@ def list_facts(
     conn: Connection = Depends(get_conn),
 ) -> list[dict]:
     if status is None:
-        rows = conn.execute(f"SELECT {FACT_COLUMNS} FROM facts ORDER BY id").fetchall()
+        rows = conn.execute(f"SELECT {FACT_SELECT_SQL} FROM facts f ORDER BY f.id").fetchall()
     else:
         rows = conn.execute(
-            f"SELECT {FACT_COLUMNS} FROM facts WHERE status = %s ORDER BY id",
+            f"SELECT {FACT_SELECT_SQL} FROM facts f WHERE f.status = %s ORDER BY f.id",
             (status,),
         ).fetchall()
     return [to_fact(r) for r in rows]
@@ -351,13 +419,14 @@ def create_fact(
             ),
         )
 
+    index_item(conn, KIND_FACT, row["id"], row["version"], row["statement"])
     return to_fact(row)
 
 
 @router.get("/facts/{fact_id}")
 def get_fact(fact_id: str, conn: Connection = Depends(get_conn)) -> dict:
     row = conn.execute(
-        f"SELECT {FACT_COLUMNS} FROM facts WHERE id = %s", (fact_id,)
+        f"SELECT {FACT_SELECT_SQL} FROM facts f WHERE f.id = %s", (fact_id,)
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Fact not found")
@@ -433,7 +502,14 @@ def update_fact(
                 suggested_fix=f"Update the content to match the new fact: {row['statement']}",
             )
 
+    if "statement" in changes and old_statement != row["statement"]:
+        index_item(conn, KIND_FACT, row["id"], row["version"], row["statement"])
+    else:
+        carry_forward(conn, KIND_FACT, row["id"], row["version"] - 1, row["version"])
+
     if impact:
+        # Deliver the alerts. This never blocks the fact change, and every attempt is recorded.
+        deliver_alerts(conn, impact.get("alerts", []))
         for item in impact.get("affectedItems", []):
             try:
                 run_check(conn, item["contentId"])
@@ -469,10 +545,115 @@ def fact_history(fact_id: str, conn: Connection = Depends(get_conn)) -> list[dic
     ]
 
 
+@router.get("/facts/{fact_id}/linked-content")
+def get_fact_linked_content(
+    fact_id: str,
+    conn: Connection = Depends(get_conn),
+    _user: dict = Depends(current_user),
+) -> list[dict]:
+    """Return published and needs-revalidation content linked to this fact."""
+    rows = conn.execute(
+        """
+        SELECT c.id, c.title, c.status, c.channel, c.owner_id,
+               u.name AS owner_name
+        FROM fact_content_links l
+        JOIN content c ON c.id = l.content_id
+        LEFT JOIN users u ON u.id = c.owner_id
+        WHERE l.source_kind = 'fact' AND l.fact_id = %s
+          AND c.status IN ('Published', 'Needs revalidation')
+        ORDER BY c.id
+        """,
+        (fact_id,),
+    ).fetchall()
+    return [
+        {
+            "contentId": r["id"],
+            "title": r["title"],
+            "status": r["status"],
+            "channel": r["channel"] or "General",
+            "ownerId": r["owner_id"],
+            "ownerName": r["owner_name"] or r["owner_id"] or "Unknown",
+        }
+        for r in rows
+    ]
+
+
+class ImpactPreviewRequest(BaseModel):
+    statement: str
+
+
+@router.post("/facts/{fact_id}/impact-preview")
+def fact_impact_preview(
+    fact_id: str,
+    body: ImpactPreviewRequest,
+    conn: Connection = Depends(get_conn),
+    _user: dict = Depends(current_user),
+) -> dict:
+    """Preview which published items would be affected by changing this fact."""
+    # Fetch current fact statement
+    fact_row = conn.execute(
+        "SELECT statement FROM facts WHERE id = %s",
+        (fact_id,),
+    ).fetchone()
+    if fact_row is None:
+        raise HTTPException(status_code=404, detail="Fact not found")
+    old_statement = fact_row["statement"]
+    new_statement = body.statement.strip()
+
+    rows = conn.execute(
+        """
+        SELECT c.id, c.title, c.channel, c.owner_id,
+               u.name AS owner_name
+        FROM fact_content_links l
+        JOIN content c ON c.id = l.content_id
+        LEFT JOIN users u ON u.id = c.owner_id
+        WHERE l.source_kind = 'fact' AND l.fact_id = %s
+          AND c.status = 'Published'
+        ORDER BY c.id
+        """,
+        (fact_id,),
+    ).fetchall()
+
+    items = []
+    for r in rows:
+        items.append({
+            "contentId": r["id"],
+            "title": r["title"],
+            "channel": r["channel"] or "General",
+            "ownerId": r["owner_id"],
+            "ownerName": r["owner_name"] or r["owner_id"] or "Unknown",
+            "oldStatement": old_statement,
+            "newStatement": new_statement,
+        })
+
+    owners = sorted({r["owner_id"] for r in rows if r["owner_id"]})
+    return {
+        "factId": fact_id,
+        "oldStatement": old_statement,
+        "newStatement": new_statement,
+        "affectedItems": items,
+        "affectedOwnerCount": len(owners),
+    }
+
+
 @router.get("/guidelines")
 def list_guidelines(conn: Connection = Depends(get_conn)) -> list[dict]:
     rows = conn.execute(
-        f"SELECT {GUIDELINE_COLUMNS} FROM guidelines ORDER BY id"
+        """
+        SELECT g.id, g.short_name, g.title, g.text, g.category, g.rule_type, g.severity,
+               g.applies_to_channels, g.required_text, g.version, g.owner_id, g.is_active, g.updated_at,
+               CASE
+                   WHEN COUNT(f.id) = 0 THEN NULL
+                   ELSE COUNT(f.id) FILTER (WHERE f.status = 'rejected')::float / COUNT(f.id)
+               END AS rejection_rate
+        FROM guidelines g
+        LEFT JOIN findings f
+            ON (f.guideline_id = g.id OR f.source_id = g.id)
+            AND f.created_at >= now() - INTERVAL '30 days'
+        GROUP BY g.id, g.short_name, g.title, g.text, g.category, g.rule_type, g.severity,
+                 g.applies_to_channels, g.required_text, g.version, g.owner_id, g.is_active, g.updated_at
+        ORDER BY g.id
+        """
     ).fetchall()
     return [to_guideline(r) for r in rows]
 
@@ -487,27 +668,30 @@ async def upload_guideline(
     user: dict = Depends(require_role(*EDITOR_ROLES)),
     conn: Connection = Depends(get_conn),
 ) -> dict:
+    check_category(conn, category)
     filename = file.filename or ""
     lower_ext = PurePath(filename).suffix.lower()
-    if lower_ext not in (".txt", ".md"):
+    if lower_ext not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail="Unsupported file type: only .txt and .md files are accepted",
+            detail="Unsupported file type: only .txt, .md, .pdf and .docx files are accepted",
         )
 
-    file_bytes = await file.read()
-    if len(file_bytes) > MAX_UPLOAD_SIZE:
+    limit = max_bytes_for(lower_ext)
+    file_bytes = await file.read(limit + 1)
+    if len(file_bytes) > limit:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="File size exceeds the 1 MB limit",
+            detail=f"File size exceeds the {limit // (1024 * 1024)} MB limit",
         )
 
     try:
-        raw_text = file_bytes.decode("utf-8")
-    except UnicodeDecodeError:
+        # Parsing PDFs and Word files is slow, so it runs off the event loop.
+        raw_text = await run_in_threadpool(extract_text, lower_ext, file_bytes)
+    except UnsupportedDocument as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="File must be valid UTF-8 text",
+            detail=str(exc),
         )
 
     text = raw_text.strip()
@@ -533,7 +717,7 @@ async def upload_guideline(
     short_name = guideline_title[:60]
 
     if applies_to_channels is None or not applies_to_channels.strip():
-        channels = list(ALLOWED_CHANNELS)
+        channels = known_channels(conn)
     else:
         channels = [c.strip() for c in applies_to_channels.split(",") if c.strip()]
         if not channels:
@@ -541,12 +725,7 @@ async def upload_guideline(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="applies_to_channels cannot be empty",
             )
-        for c in channels:
-            if c not in ALLOWED_CHANNELS:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=f"Invalid channel '{c}'. Allowed: {list(ALLOWED_CHANNELS)}",
-                )
+        check_channels(conn, channels)
 
     with conn.transaction():
         conn.execute("LOCK TABLE guidelines IN EXCLUSIVE MODE")
@@ -590,7 +769,27 @@ async def upload_guideline(
             ),
         )
 
-    return to_guideline(row)
+        extraction = extract_rule_candidates(text)
+        existing_rule_ids = [r["id"] for r in conn.execute("SELECT id FROM rule_patterns").fetchall()]
+        for candidate in extraction.candidates:
+            rule_id = generate_next_id("RP-", existing_rule_ids)
+            existing_rule_ids.append(rule_id)
+            conn.execute(
+                """
+                INSERT INTO rule_patterns
+                    (id, guideline_id, kind, pattern, replacement, case_sensitive, note, channel, is_active)
+                VALUES (%s, %s, %s, %s, %s, FALSE, %s, NULL, FALSE)
+                """,
+                (rule_id, row["id"], candidate.kind, candidate.pattern,
+                 candidate.replacement, candidate.note),
+            )
+
+    index_item(conn, KIND_GUIDELINE, row["id"], row["version"], row["text"])
+    return {
+        **to_guideline(row),
+        "ruleCandidates": len(extraction.candidates),
+        "unparsedLines": extraction.unparsed,
+    }
 
 
 @router.post("/guidelines", status_code=status.HTTP_201_CREATED)
@@ -599,6 +798,9 @@ def create_guideline(
     user: dict = Depends(require_role(*EDITOR_ROLES)),
     conn: Connection = Depends(get_conn),
 ) -> dict:
+    check_category(conn, body.category)
+    channels = body.applies_to_channels or known_channels(conn)
+    check_channels(conn, channels)
     with conn.transaction():
         conn.execute("LOCK TABLE guidelines IN EXCLUSIVE MODE")
         rows = conn.execute("SELECT id FROM guidelines").fetchall()
@@ -621,7 +823,7 @@ def create_guideline(
                 body.category,
                 body.rule_type,
                 body.severity,
-                body.applies_to_channels,
+                channels,
                 body.required_text,
                 user["id"],
             ),
@@ -641,6 +843,7 @@ def create_guideline(
             ),
         )
 
+    index_item(conn, KIND_GUIDELINE, row["id"], row["version"], row["text"])
     return to_guideline(row)
 
 
@@ -715,7 +918,109 @@ def update_guideline(
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Guideline not found")
+    if "text" in changes:
+        index_item(conn, KIND_GUIDELINE, row["id"], row["version"], row["text"])
+    else:
+        carry_forward(conn, KIND_GUIDELINE, row["id"], row["version"] - 1, row["version"])
     return to_guideline(row)
+
+
+class RulePatternUpdate(BaseModel):
+    pattern: str | None = Field(default=None, min_length=1, max_length=500)
+    replacement: str | None = Field(default=None, max_length=500)
+    note: str | None = Field(default=None, max_length=500)
+    is_active: bool | None = None
+
+
+def to_rule_pattern(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "guidelineId": row["guideline_id"],
+        "kind": row["kind"],
+        "pattern": row["pattern"],
+        "replacement": row["replacement"],
+        "note": row["note"],
+        "channel": row["channel"],
+        "isActive": row["is_active"],
+    }
+
+
+RULE_PATTERN_COLUMNS = "id, guideline_id, kind, pattern, replacement, note, channel, is_active"
+
+
+@router.get("/rule-patterns")
+def list_rule_patterns(
+    guideline_id: str | None = Query(default=None),
+    state: Literal["draft", "active"] | None = Query(default=None),
+    user: dict = Depends(require_role(*EDITOR_ROLES)),
+    conn: Connection = Depends(get_conn),
+) -> list[dict]:
+    """Rules from guidelines. Drafts are inactive until a manager approves them."""
+    clauses, params = [], []
+    if guideline_id is not None:
+        clauses.append("guideline_id = %s")
+        params.append(guideline_id)
+    if state is not None:
+        clauses.append("is_active = %s")
+        params.append(state == "active")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"SELECT {RULE_PATTERN_COLUMNS} FROM rule_patterns {where} ORDER BY id", params
+    ).fetchall()
+    return [to_rule_pattern(r) for r in rows]
+
+
+@router.delete("/rule-patterns/{rule_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+def delete_rule_pattern(
+    rule_id: str,
+    user: dict = Depends(require_role(*EDITOR_ROLES)),
+    conn: Connection = Depends(get_conn),
+) -> Response:
+    """Delete a rule. It must be switched off first, so an active rule cannot vanish by accident."""
+    with conn.transaction():
+        current = conn.execute(
+            "SELECT is_active FROM rule_patterns WHERE id = %s FOR UPDATE", (rule_id,)
+        ).fetchone()
+        if current is None:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        if current["is_active"]:
+            raise HTTPException(status_code=409, detail="Turn the rule off before deleting it")
+        conn.execute("DELETE FROM rule_patterns WHERE id = %s", (rule_id,))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.patch("/rule-patterns/{rule_id}")
+def update_rule_pattern(
+    rule_id: str,
+    body: RulePatternUpdate,
+    user: dict = Depends(require_role(*EDITOR_ROLES)),
+    conn: Connection = Depends(get_conn),
+) -> dict:
+    """Edit a draft rule, or approve it (is_active true) or switch it off (false)."""
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    with conn.transaction():
+        current = conn.execute(
+            "SELECT kind FROM rule_patterns WHERE id = %s FOR UPDATE", (rule_id,)
+        ).fetchone()
+        if current is None:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        # A bad regex would make every check that loads it fail, so check it before saving.
+        if current["kind"] == "regex" and "pattern" in changes:
+            try:
+                re.compile(changes["pattern"])
+            except re.error as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid regex: {exc}")
+
+        set_clause = ", ".join(f"{column} = %s" for column in changes)
+        row = conn.execute(
+            f"UPDATE rule_patterns SET {set_clause} WHERE id = %s RETURNING {RULE_PATTERN_COLUMNS}",
+            [*changes.values(), rule_id],
+        ).fetchone()
+
+    return to_rule_pattern(row)
 
 
 @router.get("/glossary")
